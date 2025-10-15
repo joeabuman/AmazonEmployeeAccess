@@ -1,7 +1,3 @@
-# =======================================================
-# Amazon Employee Access - Wrangling Categorical Data HW
-# =======================================================
-
 # ---------------------------
 # 0) Set Working Directory
 # ---------------------------
@@ -10,11 +6,9 @@ setwd("C:/Users/josep/OneDrive/سطح المكتب/BYU/Fall 25/Stat 348/AmazonEm
 # ---------------------------
 # 1) Libraries
 # ---------------------------
-library(vroom)
-library(dplyr)
-library(ggplot2)
-library(ggmosaic)
 library(tidymodels)
+library(embed)   # target encoding
+library(vroom)
 
 # ---------------------------
 # 2) Read Data
@@ -23,64 +17,88 @@ train <- vroom("train.csv", show_col_types = FALSE)
 test  <- vroom("test.csv",  show_col_types = FALSE)
 sampleSub <- vroom("sampleSubmission.csv", show_col_types = FALSE)
 
-# ---------------------------
-# 3) Basic EDA (fixed version, based on PowerPoint logic)
-# ---------------------------
-
-# Check class distribution
-train %>%
-  count(ACTION) %>%
-  mutate(prop = n / sum(n))
-
-# (A) RESOURCE vs ACTION
-ggplot(train, aes(x = factor(RESOURCE), fill = factor(ACTION))) +
-  geom_bar(position = "fill") +
-  labs(
-    title = "RESOURCE vs ACTION (Proportion of ACTION per RESOURCE)",
-    x = "RESOURCE",
-    y = "Proportion",
-    fill = "ACTION"
-  ) +
-  theme_minimal() +
-  theme(axis.text.x = element_blank())
-
-# (B) ROLE_DEPTNAME vs ACTION
-ggplot(train, aes(x = factor(ROLE_DEPTNAME), fill = factor(ACTION))) +
-  geom_bar(position = "fill") +
-  labs(
-    title = "ROLE_DEPTNAME vs ACTION (Proportion of ACTION per Department)",
-    x = "ROLE_DEPTNAME",
-    y = "Proportion",
-    fill = "ACTION"
-  ) +
-  theme_minimal() +
-  theme(axis.text.x = element_blank())
+# Outcome must be a factor; make "1" the event level for AUC
+train <- train %>%
+  mutate(ACTION = factor(ACTION, levels = c(1, 0)))
 
 # ---------------------------
-# 4) Recipe for Categorical Wrangling (as shown in slides)
+# 3) Recipe (categoricals → rare-level collapse → target encoding)
 # ---------------------------
-
-amazon_recipe <- recipe(ACTION ~ ., data = train) %>%
-  step_mutate_at(all_predictors(), fn = factor) %>%             # make all predictors categorical
-  step_other(all_nominal_predictors(), threshold = 0.001) %>%   # combine rare (<0.1%) categories into "other"
-  step_dummy(all_nominal_predictors())                          # convert categorical vars into dummy columns
-
-# ---------------------------
-# 5) Prep and Bake
-# ---------------------------
-prepped <- prep(amazon_recipe)
-baked_train <- bake(prepped, new_data = train)
-baked_test  <- bake(prepped, new_data = test)
+my_recipe <- recipe(ACTION ~ ., data = train) %>%
+  step_mutate_at(all_predictors(), fn = factor) %>%             # convert predictors to factors
+  step_other(all_nominal_predictors(), threshold = 0.001) %>%   # combine rare levels
+  step_lencode_mixed(all_nominal_predictors(), outcome = vars(ACTION))  # target encode
 
 # ---------------------------
-# 6) Output Results
+# 4) Penalized Logistic (glmnet)
 # ---------------------------
-cat("✅ Number of columns in baked training data:", ncol(baked_train), "\n")
-print(dim(baked_train))
-print(head(baked_train, 3))
+my_mod <- logistic_reg(
+  penalty = tune(),   # λ
+  mixture = tune()    # ν (0=ridge, 1=lasso, (0,1)=elastic net)
+) %>% 
+  set_engine("glmnet")
 
 # ---------------------------
-# 7) Optional: Save Processed Data
+# 5) Workflow
 # ---------------------------
-# vroom_write(baked_train, "baked_train.csv", delim = ",")
-# vroom_write(baked_test,  "baked_test.csv",  delim = ",")
+amazon_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(my_mod)
+
+# ---------------------------
+# 6) Light CV (fast)
+# ---------------------------
+set.seed(123)
+folds <- vfold_cv(train, v = 5)
+
+# ---------------------------
+# 7) Small tuning grid (fast)
+# ---------------------------
+tuning_grid <- grid_regular(
+  penalty(),  # default range on log scale
+  mixture(),  # 0..1
+  levels = 3  # 9 total combos → quick
+)
+
+# ---------------------------
+# 8) Tune with AUC only (avoid precision/recall warnings)
+# ---------------------------
+CV_results <- amazon_wf %>%
+  tune_grid(
+    resamples = folds,
+    grid = tuning_grid,
+    metrics = metric_set(roc_auc)
+  )
+
+# ---------------------------
+# 9) Pick best by AUC & show it
+# ---------------------------
+print(show_best(CV_results, metric = "roc_auc", n = 1))
+best_params <- select_best(CV_results, metric = "roc_auc")
+
+# ---------------------------
+# 10) Finalize & fit on all training data
+# ---------------------------
+final_wf <- amazon_wf %>%
+  finalize_workflow(best_params) %>%
+  fit(data = train)
+
+# ---------------------------
+# 11) Predict probabilities on test and build submission
+# ---------------------------
+final_predictions <- predict(final_wf, new_data = test, type = "prob")
+
+submission <- bind_cols(
+  sampleSub["id"],
+  final_predictions[".pred_1"]  # Pr(ACTION=1)
+) %>%
+  rename(ACTION = .pred_1)
+
+# ---------------------------
+# 12) Write CSV (Kaggle-ready)
+# ---------------------------
+vroom_write(submission, "mySubmission.csv")
+
+# Optional quick glance at CV metrics table
+collect_metrics(CV_results)
+
